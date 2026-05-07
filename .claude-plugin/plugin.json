@@ -1,0 +1,9 @@
+{
+  "name": "quant-researcher",
+  "description": "量化策略研究員：產生、設計、分析與回測量化交易策略",
+  "version": "1.0.0",
+  "author": {
+    "name": "gsinvest000",
+    "email": "gsinvest000@gsinvest.com.tw"
+  }
+}
