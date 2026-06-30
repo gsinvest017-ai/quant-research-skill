@@ -312,6 +312,64 @@ def walk_forward_analysis(prices: pd.Series, strategy_func,
     return pd.DataFrame(results)
 ```
 
+### 3.4 CPCV + Deflated Sharpe（**強制門檻**）
+
+單一 train/test 切分或樸素 walk-forward 不足以對抗過擬合：選擇偏誤會讓單一 OOS Sharpe 仍偏高。**強制**改用組合淨化交叉驗證（Combinatorial Purged CV, CPCV）產生 OOS Sharpe 的**分布**，並以 Deflated Sharpe Ratio（DSR）對「試了幾組」去膨脹、以 PBO 量化過擬合機率。
+
+López de Prado 的標準實作（mlfinlab 已轉閉源）已在 `gs-strategy/strategies/_common/validation/` 自寫為純 numpy/scipy 版，直接引用：
+
+```python
+# 來源：gs-strategy/strategies/_common/validation （零 zipline 耦合，可獨立 import）
+from validation import (
+    combinatorial_purged_splits,   # 淨化 + embargo 的 CPCV 切分
+    deflated_sharpe_ratio,         # Bailey & LdP：對 n_trials 去膨脹
+    pbo,                           # Probability of Backtest Overfitting
+)
+
+# 1) 對每條 CPCV path 重算策略 OOS Sharpe → 得到 Sharpe 分布
+# 2) DSR：把「總共試了幾組參數/模型」當 n_trials 餵進去
+dsr = deflated_sharpe_ratio(oos_returns, n_trials=n_configs_tried)
+# 3) PBO：把各參數組在各 CPCV path 的績效矩陣餵進去
+pbo_prob = pbo(performance_matrix, n_splits=10)
+```
+
+**硬性判定（必須在報告中明列數字）**：
+
+| 指標 | 門檻 | 不過的後果 |
+|------|------|-----------|
+| Deflated Sharpe `P(skill)` | < 0.95 | 結論**不得**標 PASS（最多 CONDITIONAL） |
+| PBO | > 0.5 | 視為**過擬合**，標 FAIL |
+| CPCV OOS Sharpe 中位數 | ≤ 0 | 標 FAIL |
+
+> 若策略規格只提供單點 IS Sharpe、未提供 CPCV 分布或 DSR，視為**未通過統計驗證**，在報告 Phase 5 直接降級。
+
+### 3.5 因果去擬合（DoubleML + DoWhy refutation，**強制門檻**）
+
+「相關 ≠ 因果」。一個在 IS 漂亮的因子，可能只是透過混淆變數（市場 β、波動體制、其他因子）與報酬相關，實盤即失效。**強制**對每個核心因子做因果檢驗：用 Double ML 控制混淆變數估「淨」因果效應，再用 DoWhy 的反駁器（placebo / random common cause / data subset）試圖證偽。
+
+已在 `gs-strategy/strategies/_common/causal/` 封裝成一條 pass/fail loop（重套件 optional，未裝時退化 numpy fallback）：
+
+```python
+# 來源：gs-strategy/strategies/_common/causal
+from causal import causal_factor_verdict, format_verdict
+
+v = causal_factor_verdict(
+    panel,                          # 欄：forward_return / factor / confounders
+    factor="mom",
+    forward_return="fwd_ret",
+    candidate_confounders=["vol", "rev", "market_beta"],
+)
+print(format_verdict(v))            # → PASS / CONDITIONAL / FAIL
+```
+
+**硬性判定**：
+
+- 因子在控制混淆變數後**不顯著**（p ≥ 0.05）→ 該因子標 FAIL，不得作為策略 alpha 來源。
+- DoWhy refutation 任一項不過（placebo 效應不消失、或 random-cc / subset 下效應翻轉）→ 最多 CONDITIONAL，並在報告明列哪一項不過。
+- 報告須附 `method` 欄（`doubleml`/`dowhy` 表示用真套件；`*_fallback` 表示僅線性近似，須註明可信度較低）。
+
+> 實證提醒：TX/MTX 12-1 月頻動量在 2019–2026（170 obs）控制 vol/reversal/跨品種動能後 **p=0.181 不顯著**——這正是此門檻要攔下的「看起來有、其實過不了因果」案例。
+
 ---
 
 ## Phase 4：改進建議
@@ -380,6 +438,16 @@ review_<策略縮寫>_<YYYYMMDD>.md
 
 [Bootstrap CI、Permutation Test、Walk-Forward 結果表格]
 
+### 強制門檻檢查表（缺一即降級，須逐項填數字）
+
+| 門檻 | 數值 | 通過? |
+|------|------|-------|
+| Deflated Sharpe `P(skill)`（n_trials=__） | __ | ✅/❌ |
+| PBO | __ | ✅/❌ |
+| CPCV OOS Sharpe 中位數 | __ | ✅/❌ |
+| 核心因子因果效應 p（控制混淆變數後） | __ | ✅/❌ |
+| DoWhy refutation（placebo / random-cc / subset） | __ | ✅/❌ |
+
 ---
 
 ## 四、改進建議（按優先順序）
@@ -408,3 +476,4 @@ review_<策略縮寫>_<YYYYMMDD>.md
 - **程式碼必須可執行**：報告中的每段 Python 程式碼必須使用真實資料且可獨立執行，不接受偽代碼作為驗證結果。
 - **最壞情境為基準**：績效評估以最壞合理情境（higher costs, adverse slippage, bear regime）為基準，不以平均情境報告。
 - **獨立性原則**：審查者不為任何特定結論辯護。若策略通過所有測試，如實記錄；若全部失敗，如實記錄。
+- **強制門檻不可豁免**：Phase 3.4（CPCV + Deflated Sharpe + PBO）與 Phase 3.5（DoubleML + DoWhy 因果去擬合）為**硬性審查項**。任一未提供或未通過，最終結論**不得**標 PASS；單點 IS Sharpe、無 CPCV 分布、無 DSR、無因果檢驗者，一律視為未通過統計驗證並在結論中明列缺項。可直接引用 `gs-strategy/strategies/_common/{validation,causal}` 的實作執行，毋須重寫。
