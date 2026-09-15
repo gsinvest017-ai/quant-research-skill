@@ -322,51 +322,70 @@ López de Prado 的標準實作（mlfinlab 已轉閉源）已在 `gs-strategy/st
 # 來源：gs-strategy/strategies/_common/validation （零 zipline 耦合，可獨立 import）
 from validation import (
     combinatorial_purged_splits,   # 淨化 + embargo 的 CPCV 切分
+    block_sharpes,                 # 不重疊區塊 Sharpe（沒有參數的策略用這個）
     deflated_sharpe_ratio,         # Bailey & LdP：對 n_trials 去膨脹
+    dsr_sr_variance,               # DSR 用的跨試驗 Sharpe 變異數（含 1/(T-1) 下限）
+    effective_n_trials,            # 有效試驗數（participation ratio），與名目 N 並列
+    min_track_record_length,       # MinTRL
     pbo,                           # Probability of Backtest Overfitting
 )
 
-# 1) 對每條 CPCV path 重算策略 OOS Sharpe → 得到 Sharpe 分布
-# 2) DSR：把「總共試了幾組參數/模型」當 n_trials 餵進去
-dsr = deflated_sharpe_ratio(oos_returns, n_trials=n_configs_tried)
-# 3) PBO：把各參數組在各 CPCV path 的績效矩陣餵進去
-pbo_prob = pbo(performance_matrix, n_splits=10)
+# 1) 有參數要選的策略：每條 CPCV path 在訓練段選參數、在測試段算 OOS Sharpe → 分布
+#    沒有參數的策略：CPCV 測試段互相重疊（每組出現在 C(N-1,k-1) 條 path），
+#    中位數約等於全樣本 Sharpe，不是樣本外證據 → 改報 6 個不重疊區塊的 Sharpe
+blocks = block_sharpes(returns, n_blocks=6)
+# 2) DSR：n_trials = 試驗帳本上「所有」試過的組數（含事後探索）
+#    變異數只能用同樣本長度、同報酬型態的試驗 Sharpe
+V = dsr_sr_variance(trial_sharpes_same_T, n_obs=len(returns))
+dsr = deflated_sharpe_ratio(returns, n_trials=n_configs_tried, sr_variance_across_trials=V)
+# 3) PBO：各參數組 × 時間的報酬矩陣；一律以 Sharpe 評分（預設）
+pbo_prob = pbo(performance_matrix, n_splits=10, metric="sharpe")
 ```
 
 **硬性判定（必須在報告中明列數字）**：
 
 | 指標 | 門檻 | 不過的後果 |
 |------|------|-----------|
-| Deflated Sharpe `P(skill)` | < 0.95 | 結論**不得**標 PASS（最多 CONDITIONAL） |
-| PBO | > 0.5 | 視為**過擬合**，標 FAIL |
-| CPCV OOS Sharpe 中位數 | ≤ 0 | 標 FAIL |
+| Deflated Sharpe `P(skill)` | < 0.95 | 標 **FAIL**（與 `stat-ruleset`「冠軍任一關失敗即本輪 FAIL」一致） |
+| PBO（`metric="sharpe"`） | > 0.5 | 視為**過擬合**，標 FAIL |
+| CPCV OOS Sharpe 中位數（有參數）／不重疊區塊 Sharpe 中位數（無參數） | ≤ 0 | 標 FAIL |
 
-> 若策略規格只提供單點 IS Sharpe、未提供 CPCV 分布或 DSR，視為**未通過統計驗證**，在報告 Phase 5 直接降級。
+- 不得用 `metric="mean"` 的 PBO 作通過依據：設定之間主要差在波動（EW/VW、槓桿、分組數）時，平均報酬評分會一直選到最高波動的設定，PBO 趨近 0。
+- 所有設定都虧損時 PBO 沒有判定意義，須在報告明寫。
+- DSR 須同時列名目 N、`effective_n_trials` 與 MinTRL；有效 N 只能描述，不得在看到結果後用來調低預先登錄的 N。
 
-### 3.5 因果去擬合（DoubleML + DoWhy refutation，**強制門檻**）
+> 若策略規格只提供單點 IS Sharpe、未提供 CPCV 分布（或區塊 Sharpe）或 DSR，視為**未通過統計驗證**，在報告 Phase 5 直接降級。
 
-「相關 ≠ 因果」。一個在 IS 漂亮的因子，可能只是透過混淆變數（市場 β、波動體制、其他因子）與報酬相關，實盤即失效。**強制**對每個核心因子做因果檢驗：用 Double ML 控制混淆變數估「淨」因果效應，再用 DoWhy 的反駁器（placebo / random common cause / data subset）試圖證偽。
+### 3.5 因果去擬合（cluster DML ＋ 逐期效應 ＋ 時間區塊穩定度，**強制門檻**）
 
-已在 `gs-strategy/strategies/_common/causal/` 封裝成一條 pass/fail loop（重套件 optional，未裝時退化 numpy fallback）：
+「相關 ≠ 因果」。一個在 IS 漂亮的因子，可能只是透過混淆變數（市場 β、波動體制、其他因子）或同期共同衝擊與報酬相關，實盤即失效。**強制**對每個核心因子：用交叉擬合部分線性 DML 控制混淆變數估淨效應，並**以期間為 cluster** 做推論；再用逐期斜率（Fama–MacBeth）與互不重疊時間區塊的方向一致性，確認效應不是共同衝擊造成的。
+
+已在 `gs-strategy/strategies/_common/causal/` 封裝成一條 pass/fail loop（只需 numpy/pandas/scipy；scikit-learn 選配）：
 
 ```python
 # 來源：gs-strategy/strategies/_common/causal
 from causal import causal_factor_verdict, format_verdict
 
 v = causal_factor_verdict(
-    panel,                          # 欄：forward_return / factor / confounders
+    panel,                          # 欄：forward_return / factor / confounders / 期間
     factor="mom",
     forward_return="fwd_ret",
     candidate_confounders=["vol", "rev", "market_beta"],
+    time_col="date",                # 多檔 × 多期的面板必填
 )
 print(format_verdict(v))            # → PASS / CONDITIONAL / FAIL
 ```
 
 **硬性判定**：
 
-- 因子在控制混淆變數後**不顯著**（p ≥ 0.05）→ 該因子標 FAIL，不得作為策略 alpha 來源。
-- DoWhy refutation 任一項不過（placebo 效應不消失、或 random-cc / subset 下效應翻轉）→ 最多 CONDITIONAL，並在報告明列哪一項不過。
-- 報告須附 `method` 欄（`doubleml`/`dowhy` 表示用真套件；`*_fallback` 表示僅線性近似，須註明可信度較低）。
+- 面板必須傳 `time_col`；沒有傳的結果最多 CONDITIONAL，而且不得作為通過依據。
+- cluster DML p ≥ 0.05、逐期 NW |t| 未達 t 臨界值，或兩者方向不一致 → 該因子標 FAIL，不得作為策略 alpha 來源。
+- 時間區塊方向一致比例 < 0.7 → 最多 CONDITIONAL，並在報告明列區塊結果。
+- 控制變數以預先登錄清單為準，只能加、不能刪；不得用 PC 等因果探索結果縮減。
+- 報告須列 `method`、cluster 數、`design_effect`，並把 iid p 值與 cluster p 值並列；`*_fallback` 表示 nuisance 只用線性近似，須註明。
+- DoWhy 的 placebo／random common cause／data subset 只能作描述、不得當門檻：placebo 在任何資料生成過程下期望值都是 0，random common cause 只讓估計值移動 O(1/√n)，data subset 估的是同一個機率極限，三者對共同衝擊造成的偽效應都沒有檢定力。
+
+> 為什麼這樣改（2026-09）：gs-ai-capex-cycle 的獨立審查發現，股票×月面板上 iid 標準誤比 cluster 小 1.9–2.3 倍，純雜訊因子 iid 拒絕率 33%–63%，舊流程（iid DML＋PC 縮減＋DoWhy 反駁）對雜訊訊號 6 次有 1 次判 PASS。
 
 > 實證提醒：TX/MTX 12-1 月頻動量在 2019–2026（170 obs）控制 vol/reversal/跨品種動能後 **p=0.181 不顯著**——這正是此門檻要攔下的「看起來有、其實過不了因果」案例。
 
@@ -442,11 +461,12 @@ review_<策略縮寫>_<YYYYMMDD>.md
 
 | 門檻 | 數值 | 通過? |
 |------|------|-------|
-| Deflated Sharpe `P(skill)`（n_trials=__） | __ | ✅/❌ |
-| PBO | __ | ✅/❌ |
-| CPCV OOS Sharpe 中位數 | __ | ✅/❌ |
-| 核心因子因果效應 p（控制混淆變數後） | __ | ✅/❌ |
-| DoWhy refutation（placebo / random-cc / subset） | __ | ✅/❌ |
+| Deflated Sharpe `P(skill)`（名目 n_trials=__、有效 N=__、MinTRL=__） | __ | ✅/❌ |
+| PBO（`metric="sharpe"`） | __ | ✅/❌ |
+| CPCV OOS Sharpe 中位數，或不重疊區塊 Sharpe（無參數策略，逐塊列出） | __ | ✅/❌ |
+| 核心因子 cluster DML p（`time_col`=__、cluster 數=__、design effect=__、iid p=__） | __ | ✅/❌ |
+| 逐期效應 Newey–West t | __ | ✅/❌ |
+| 時間區塊方向一致比例（≥ 0.7） | __ | ✅/❌ |
 
 ---
 
@@ -476,4 +496,4 @@ review_<策略縮寫>_<YYYYMMDD>.md
 - **程式碼必須可執行**：報告中的每段 Python 程式碼必須使用真實資料且可獨立執行，不接受偽代碼作為驗證結果。
 - **最壞情境為基準**：績效評估以最壞合理情境（higher costs, adverse slippage, bear regime）為基準，不以平均情境報告。
 - **獨立性原則**：審查者不為任何特定結論辯護。若策略通過所有測試，如實記錄；若全部失敗，如實記錄。
-- **強制門檻不可豁免**：Phase 3.4（CPCV + Deflated Sharpe + PBO）與 Phase 3.5（DoubleML + DoWhy 因果去擬合）為**硬性審查項**。任一未提供或未通過，最終結論**不得**標 PASS；單點 IS Sharpe、無 CPCV 分布、無 DSR、無因果檢驗者，一律視為未通過統計驗證並在結論中明列缺項。可直接引用 `gs-strategy/strategies/_common/{validation,causal}` 的實作執行，毋須重寫。
+- **強制門檻不可豁免**：Phase 3.4（CPCV + Deflated Sharpe + PBO）與 Phase 3.5（cluster DML ＋ 逐期效應 ＋ 時間區塊穩定度）為**硬性審查項**。任一未提供或未通過，最終結論**不得**標 PASS；單點 IS Sharpe、無 CPCV 分布（或區塊 Sharpe）、無 DSR、無因果檢驗、面板因果檢驗未依期間 cluster 者，一律視為未通過統計驗證並在結論中明列缺項。可直接引用 `gs-strategy/strategies/_common/{validation,causal}` 的實作執行，毋須重寫。
